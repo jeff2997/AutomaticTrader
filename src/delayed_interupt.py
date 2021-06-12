@@ -1,3 +1,9 @@
+#
+# Source:
+#   https://stackoverflow.com/a/21919644/11730916
+# Author:
+#   https://stackoverflow.com/users/72911/gary-van-der-merwe
+#
 import signal
 import logging
 

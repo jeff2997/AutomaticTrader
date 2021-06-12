@@ -1,10 +1,23 @@
+import requests
 import queue
 import time
-import delayed_interupt as di
+from . import delayed_interupt as di
+from . import bank as Bank
 
 class StockTrader():
-    def __init__(self, bank, **kwargs):
+    def __init__(self, bank: Bank, **kwargs):
         self.__bank = bank
+
+        self.__URL_CURRENT_PRICE = kwargs.get("URL_CURRENT_PRICE", None)
+        self.__URL_24HR_CHANGE = kwargs.get("URL_CURRENT_PRICE", None)
+        self.__URL_AVG_PRICE = kwargs.get("URL_CURRENT_PRICE", None)
+        self.__parameters = kwargs.get("parameters", None)
+        if (self.__URL_CURRENT_PRICE == None or
+        self.__URL_24HR_CHANGE == None or
+        self.__URL_AVG_PRICE == None or
+        self.__parameters == None):
+            raise Exception("Must Provide urls for price checks")
+
         self.__frequency = kwargs.get("frequency", 2)
         self.__percent_change = kwargs.get("percent_change", 0.015)
         self.__trend_set_percentage = kwargs.get("trend_set_percentage", 0.003)
@@ -83,22 +96,137 @@ class StockTrader():
     def set_stop_loss_enabled(self, stop_loss_enabled):
         self.__stop_loss_enabled = stop_loss_enabled
 
-    def set_starting_price(self, starting_price):
-        self.__starting_price = starting_price
+    def get_current_price(self):
+        response = requests.get(self.__URL_CURRENT_PRICE, params=self.__parameters)
+        return float(response.json()["price"])
 
-    def set_starting_average(self, starting_avg):
-        self.__starting_avg = starting_avg
+    def get_avg_price(self):
+        response = requests.get(self.__URL_AVG_PRICE, params=self.__parameters)
+        return float(response.json()["price"])
+
+    def get_starting_price(self):
+        return self.__starting_price
+
+    def get_starting_avg(self):
+        return self.__starting_avg
+
+    def get_last_price_avg(self):
+        return self.__last_price_avg
+
+    def get_last_price(self):
+        return self.__last_price
+
+    def get_low_price(self):
+        return self.__low_price
+
+    def get_high_price(self):
+        return self.__high_price
 
     def run(self):
+        self.__starting_price = self.get_current_price()
+        self.__starting_avg = self.get_avg_price()
+        self.__last_price_avg = self.__starting_avg
+        self.__last_price = self.__starting_price
+        self.__low_price = self.__starting_price
+        self.__high_price = self.__starting_price
         while (True):
             with di.DelayedKeyboardInterrupt():
-                self.__log(True, 10, "ETH", 100, 10)
-                self.__log(False, 10, "ETH", 100, 10)
+                eth_price = self.get_current_price()
+                eth_price_avg = self.get_avg_price()
+                if eth_price_avg >= self.__last_price_avg:
+                    self.__ascending = True
+                else:
+                    self.__ascending = False
+
+                if self.__count >= self.__init:
+                    self.__rate_of_change = (eth_price_avg - self.__avg_five_min.get())
+                    num_arc_samples = 150
+                    self.__arc_sum += self.__rate_of_change
+                    if self.__count >= self.__init + num_arc_samples * self.__frequency:
+                        self.__arc_average = (self.__arc_sum / num_arc_samples)  
+
+                
+                self.__avg_five_min.put(eth_price_avg)
+
+                #instantaneous rate of change
+                irc = eth_price - self.__last_price
+                num_samples = 30
+                samples_taken = 0
+                if self.__count >= self.__frequency * num_samples:
+                    self.__rrc_queue.put(irc)
+                    self.__rrc_sum -= self.__rrc_queue.get()
+                    self.__rrc_average = (self.__rrc_sum / num_samples) * (60/self.__frequency)
+                else:
+                    self.__rrc_queue.put(irc)
+                    self.__rrc_sum += irc
+                    samples_taken += 1
+                    self.__rrc_average = (self.__rrc_sum / samples_taken) * (60/self.__frequency)
+
+                # average rate of change
+                
+
+                if eth_price < self.__low_price:
+                    self.__low_price = eth_price
+                        
+                if eth_price > self.__high_price:
+                    self.__high_price = eth_price
+                
+                self.__buy_target = self.__low_price * (1 + self.__percent_change)    
+                
+                # Buy if Low
+                if eth_price >= self.__low_price * (1 + self.__percent_change) and self.__ascending == True and eth_price >= self.__low_price * (1 + self.__trend_set_percentage) and self.__bank.getUSDBalance() != 0:
+                    amount_usd = self.__bank.getUSDBalance()
+                    eth_purchased = self.__bank.buyETH(amount_usd, eth_price)
+                    print("You bought ", eth_purchased, " ETH!\n\n")
+                    log(True, eth_purchased, "ETH", amount_usd, eth_price)
+                    self.__low_price = eth_price
+                    self.__high_price = eth_price
+                    self.__sell_target = eth_price * (1 + self.__percent_change)
+                
+                # Sell if made 5% and trending down
+                if self.__sell_target != -1 and eth_price >= self.__sell_target and not self.__ascending and eth_price <= self.__high_price * (1 - self.__trend_set_percentage) and self.__bank.getETHBalance() != 0:
+                    eth_sold = self.__bank.sellETH(self.__bank.getETHBalance(), eth_price)
+                    print("You sold ", eth_sold, " ETH!\n\n")
+                    amount_usd = eth_sold * eth_price
+                    log(False, eth_sold, "ETH", amount_usd, eth_price)
+                    self.__low_price = eth_price
+                    self.__high_price = eth_price
+
+                # Trigger Stop Loss if necessary
+                if self.__stop_loss_enabled and eth_price < (1 - self.__stop_loss_percentage) * self.__bank.getAvgETHPurchasePrice() and not self.__ascending and self.__bank.getETHBalance() > 0:
+                    eth_sold = self.__bank.sellETH(self.__bank.getETHBalance(), eth_price)
+                    print("Stop loss triggered - you sold ", eth_sold, " ETH!\n\n")
+                    self.__low_price = eth_price
+                    self.__high_price = eth_price
+                    self.__sell_target = 100000000000 # change to -1 (already used as -1 elsewhere) or float('inf')
+
+
+                self.__last_price = eth_price
+                
+                if self.__ascending == False:
+                    status = "Desc"
+                else:
+                    status = "Asce"
+
+                print("CP: $", round(eth_price,2), ", RC: ", (str(round(self.__rate_of_change, 4)) + "/min" if self.__rate_of_change != None else "..."),
+                        ", RRC: ", str(round(self.__rrc_average, 4)) + "/min" if self.__rrc_average != None else "...",
+                        ", ARC: ", str(round(self.__arc_average, 4)) + "/min" if self.__arc_average != None else "...", ", T: ", status,
+                        ", H: $", round(self.__high_price,2), ", L: $", round(self.__low_price,2), ", ST: $", round(self.__sell_target,2), ", BT: $",
+                        round(self.__buy_target,2), ", PV: $", self.__bank.getPortfolioValue(0, 0, eth_price), end="      \r") 
+
+                self.__count += self.__frequency
                 time.sleep(self.__frequency)
 
 
 # test application
 if (__name__ == "__main__"):
     import bank as b
-    trader = StockTrader(b.bank(700))
+    trader = StockTrader(b.bank(7000),
+        URL_CURRENT_PRICE = "https://api.binance.us/api/v3/ticker/price",
+        URL_24HR_CHANGE = "https://api.binance.us/api/v3/ticker/24hr",
+        URL_AVG_PRICE = "https://api.binance.us/api/v3/avgPrice",
+        parameters = {
+            "symbol": "ETHUSD"
+        }
+    )
     trader.run()
